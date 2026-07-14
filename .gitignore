@@ -1,0 +1,12 @@
+# PyInstaller 打包產物
+build/
+dist/
+build.log
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# 本機工具設定
+.claude/
