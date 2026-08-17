@@ -119,6 +119,20 @@ class AppConfig:
     def find_device(self, mac: str) -> Device | None:
         return next((d for d in self.devices if d.mac == mac), None)
 
+    def device_index(self, mac: str) -> int:
+        """回傳設備在清單中的序號 (1 起算), 找不到回傳 0."""
+        for i, d in enumerate(self.devices, 1):
+            if d.mac == mac:
+                return i
+        return 0
+
+    def device_label(self, mac: str) -> str:
+        """統一的設備顯示字串, 例如 "2. Bot-1A2B"."""
+        d = self.find_device(mac)
+        if d is None:
+            return f"(已移除) {mac}"
+        return f"{self.device_index(mac)}. {d.name or 'WoHand'}"
+
 
 class BleWorker:
     def __init__(self, log_cb: Callable[[str], None]) -> None:
@@ -437,8 +451,9 @@ class SchedulerThread:
             time.sleep(1)
 
     def _device_label(self, cfg: AppConfig, mac: str) -> str:
-        d = cfg.find_device(mac)
-        return d.name if (d and d.name) else (mac or "?")
+        if cfg.find_device(mac) is None:
+            return mac or "?"
+        return cfg.device_label(mac)
 
     def _rebuild(self) -> None:
         schedule.clear()
@@ -608,19 +623,21 @@ class ScanDialog(tk.Toplevel):
 
 class ScheduleDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, devices: list[Device],
-                 item: ScheduleItem | None = None) -> None:
+                 item: ScheduleItem | None = None,
+                 default_mac: str = "") -> None:
         super().__init__(parent)
         self.title("排程設定")
-        self.geometry("420x340")
+        self.geometry("460x340")
         self.transient(parent)
         self.grab_set()
         self.result: ScheduleItem | None = None
         self._devices = devices
 
+        fallback_mac = default_mac or (devices[0].mac if devices else "")
         d = item or ScheduleItem(
             id=0, time="08:00", action="on",
             days=[0, 1, 2, 3, 4],
-            device_mac=devices[0].mac if devices else "",
+            device_mac=fallback_mac,
             enabled=True,
         )
 
@@ -639,9 +656,12 @@ class ScheduleDialog(tk.Toplevel):
         frm_dev = ttk.Frame(self)
         frm_dev.pack(fill="x", padx=12, pady=4)
         ttk.Label(frm_dev, text="設備:").pack(side="left")
-        labels = [f"{dev.name or 'WoHand'}  {dev.mac}" for dev in devices]
+        labels = [
+            f"{i}. {dev.name or 'WoHand'}  {dev.mac}"
+            for i, dev in enumerate(devices, 1)
+        ]
         self.cmb_dev = ttk.Combobox(
-            frm_dev, values=labels, state="readonly", width=38
+            frm_dev, values=labels, state="readonly", width=40
         )
         self.cmb_dev.pack(side="left", padx=6)
         if labels:
@@ -747,18 +767,25 @@ class App(tk.Tk):
         # 設備清單
         frm_d = ttk.LabelFrame(self, text="設備")
         frm_d.pack(fill="x", padx=10, pady=6)
-        cols_d = ("name", "mac")
+        ttk.Label(
+            frm_d, text="選取設備後, 下方排程只顯示該設備的項目",
+            foreground="#666",
+        ).pack(anchor="w", padx=6, pady=(4, 0))
+        cols_d = ("idx", "name", "mac", "count")
         self.tree_dev = ttk.Treeview(
             frm_d, columns=cols_d, show="headings", height=4,
             selectmode="browse",
         )
         for c, t, w, a in [
-            ("name", "名稱", 240, "w"),
-            ("mac", "MAC", 220, "w"),
+            ("idx", "#", 40, "center"),
+            ("name", "名稱", 200, "w"),
+            ("mac", "MAC", 200, "w"),
+            ("count", "排程數", 60, "center"),
         ]:
             self.tree_dev.heading(c, text=t)
             self.tree_dev.column(c, width=w, anchor=a)
         self.tree_dev.pack(fill="x", padx=6, pady=(6, 0))
+        self.tree_dev.bind("<<TreeviewSelect>>", lambda e: self._on_device_select())
 
         frm_db = ttk.Frame(frm_d)
         frm_db.pack(fill="x", pady=6)
@@ -770,19 +797,20 @@ class App(tk.Tk):
             ttk.Button(frm_db, text=txt, command=cmd).pack(side="left", padx=4)
 
         # 手動測試
-        frm_m = ttk.LabelFrame(self, text="手動測試 (對選取的設備)")
-        frm_m.pack(fill="x", padx=10, pady=6)
+        self.frm_m = ttk.LabelFrame(self, text="手動測試")
+        self.frm_m.pack(fill="x", padx=10, pady=6)
         for act, label in [("on", "開啟"), ("off", "關閉"), ("press", "按壓")]:
-            ttk.Button(frm_m, text=label,
+            ttk.Button(self.frm_m, text=label,
                        command=lambda a=act: self._manual(a)).pack(
                 side="left", padx=6, pady=8
             )
 
         # 排程
-        frm_s = ttk.LabelFrame(self, text="排程")
-        frm_s.pack(fill="both", expand=True, padx=10, pady=6)
+        self.frm_s = ttk.LabelFrame(self, text="排程")
+        self.frm_s.pack(fill="both", expand=True, padx=10, pady=6)
         cols = ("en", "device", "time", "action", "days")
-        self.tree = ttk.Treeview(frm_s, columns=cols, show="headings", height=8)
+        self.tree = ttk.Treeview(self.frm_s, columns=cols, show="headings",
+                                 height=8)
         for c, t, w, a in [
             ("en", "啟用", 50, "center"),
             ("device", "設備", 140, "w"),
@@ -795,7 +823,7 @@ class App(tk.Tk):
         self.tree.pack(fill="both", expand=True, padx=6, pady=(6, 0))
         self.tree.bind("<Double-1>", lambda e: self._edit())
 
-        frm_b = ttk.Frame(frm_s)
+        frm_b = ttk.Frame(self.frm_s)
         frm_b.pack(fill="x", pady=6)
         for txt, cmd in [
             ("新增", self._add),
@@ -804,6 +832,11 @@ class App(tk.Tk):
             ("啟用/停用", self._toggle),
         ]:
             ttk.Button(frm_b, text=txt, command=cmd).pack(side="left", padx=4)
+        self.var_show_all = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_b, text="顯示所有設備", variable=self.var_show_all,
+            command=self._refresh_list,
+        ).pack(side="right", padx=6)
 
         # 日誌
         frm_l = ttk.LabelFrame(self, text="日誌")
@@ -857,10 +890,15 @@ class App(tk.Tk):
         prev_sel = self.tree_dev.selection()
         for i in self.tree_dev.get_children():
             self.tree_dev.delete(i)
-        for d in self.cfg.devices:
+        for idx, d in enumerate(self.cfg.devices, 1):
+            n = sum(1 for s in self.cfg.schedules if s.device_mac == d.mac)
+            active = sum(
+                1 for s in self.cfg.schedules
+                if s.device_mac == d.mac and s.enabled
+            )
             self.tree_dev.insert(
                 "", "end", iid=d.mac,
-                values=(d.name or "WoHand", d.mac),
+                values=(idx, d.name or "WoHand", d.mac, f"{active}/{n}"),
             )
         # 維持原選取或預選第一個
         target = None
@@ -872,21 +910,46 @@ class App(tk.Tk):
             self.tree_dev.selection_set(target)
             self.tree_dev.focus(target)
 
+    def _on_device_select(self) -> None:
+        self._refresh_list()
+
     def _refresh_list(self) -> None:
+        show_all = self.var_show_all.get()
+        sel = self._selected_device()
+
+        if show_all:
+            self.frm_s.config(text="排程 (所有設備)")
+            self.frm_m.config(
+                text="手動測試"
+                + (f" - {self.cfg.device_label(sel.mac)}" if sel else "")
+            )
+        elif sel:
+            label = self.cfg.device_label(sel.mac)
+            self.frm_s.config(text=f"排程 - {label}")
+            self.frm_m.config(text=f"手動測試 - {label}")
+        else:
+            self.frm_s.config(text="排程 (請先選取設備)")
+            self.frm_m.config(text="手動測試 (請先選取設備)")
+
         for i in self.tree.get_children():
             self.tree.delete(i)
-        for s in sorted(self.cfg.schedules,
-                        key=lambda x: (x.device_mac, x.time)):
+
+        items = self.cfg.schedules
+        if not show_all:
+            items = [s for s in items if sel and s.device_mac == sel.mac]
+
+        for s in sorted(
+            items,
+            key=lambda x: (self.cfg.device_index(x.device_mac) or 999, x.time),
+        ):
             days = "每天" if len(s.days) == 7 else "、".join(
                 WEEKDAY_NAMES[d] for d in sorted(s.days)
             )
-            dev = self.cfg.find_device(s.device_mac)
-            dev_label = (dev.name or "WoHand") if dev else f"(已移除) {s.device_mac}"
             self.tree.insert(
                 "", "end", iid=str(s.id),
                 values=(
                     "V" if s.enabled else "",
-                    dev_label,
+                    self.cfg.device_label(s.device_mac),
                     s.time,
                     ACTION_NAMES[s.action],
                     days,
@@ -915,10 +978,16 @@ class App(tk.Tk):
         self.cfg.devices.append(Device(mac=info["mac"], name=name))
         self.cfg.save()
         self._refresh_devices()
+        # 選取剛新增的設備, 讓使用者可直接為它設定排程
+        self.tree_dev.selection_set(info["mac"])
+        self.tree_dev.focus(info["mac"])
         self._refresh_list()
         self.scheduler.refresh()
         self.ble.watch_all([d.mac for d in self.cfg.devices])
-        self._log(f"已新增設備: {name} ({info['mac']})")
+        self._log(
+            f"已新增設備 {self.cfg.device_index(info['mac'])}: "
+            f"{name} ({info['mac']})"
+        )
 
     def _rename_device(self) -> None:
         d = self._selected_device()
@@ -972,7 +1041,7 @@ class App(tk.Tk):
         if not d:
             messagebox.showwarning("無選取", "請先在設備清單中選取一個設備")
             return
-        label = d.name or d.mac
+        label = self.cfg.device_label(d.mac)
         self._log(f"手動 [{label}] {ACTION_NAMES[action]} ...")
         self.ble.submit_control(
             d.mac, action,
@@ -990,15 +1059,30 @@ class App(tk.Tk):
         if not self.cfg.devices:
             messagebox.showwarning("無設備", "請先新增至少一個設備")
             return
-        dlg = ScheduleDialog(self, self.cfg.devices)
+        sel = self._selected_device()
+        dlg = ScheduleDialog(
+            self, self.cfg.devices, default_mac=sel.mac if sel else ""
+        )
         self.wait_window(dlg)
         if dlg.result:
             dlg.result.id = self._next_id
             self._next_id += 1
             self.cfg.schedules.append(dlg.result)
             self.cfg.save()
+            self._focus_device(dlg.result.device_mac)
+            self._refresh_devices()
             self._refresh_list()
             self.scheduler.refresh()
+
+    def _focus_device(self, mac: str) -> None:
+        """把設備清單選取切到 mac, 讓剛新增/修改的排程在過濾後仍看得見."""
+        if self.var_show_all.get() or not self.cfg.find_device(mac):
+            return
+        sel = self._selected_device()
+        if sel is not None and sel.mac == mac:
+            return
+        self.tree_dev.selection_set(mac)
+        self.tree_dev.focus(mac)
 
     def _edit(self) -> None:
         s = self._selected()
@@ -1016,6 +1100,8 @@ class App(tk.Tk):
             s.enabled = dlg.result.enabled
             s.device_mac = dlg.result.device_mac
             self.cfg.save()
+            self._focus_device(s.device_mac)
+            self._refresh_devices()
             self._refresh_list()
             self.scheduler.refresh()
 
@@ -1024,11 +1110,14 @@ class App(tk.Tk):
         if not s:
             return
         if not messagebox.askyesno(
-            "確認", f"刪除排程: {s.time} {ACTION_NAMES[s.action]} ?"
+            "確認",
+            f"刪除排程: [{self.cfg.device_label(s.device_mac)}] "
+            f"{s.time} {ACTION_NAMES[s.action]} ?"
         ):
             return
         self.cfg.schedules = [x for x in self.cfg.schedules if x.id != s.id]
         self.cfg.save()
+        self._refresh_devices()
         self._refresh_list()
         self.scheduler.refresh()
 
@@ -1038,6 +1127,7 @@ class App(tk.Tk):
             return
         s.enabled = not s.enabled
         self.cfg.save()
+        self._refresh_devices()
         self._refresh_list()
         self.scheduler.refresh()
 
